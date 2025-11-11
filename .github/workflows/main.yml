@@ -1,10 +1,15 @@
 name: MID → MML → NSF converter
 
-# mids/ に .mid を push したら動く
 on:
   push:
     paths:
       - 'mids/**'
+  workflow_dispatch:
+    inputs:
+      mid_filename:
+        description: '（任意）処理したい mids/<filename.mid> を指定。未指定なら mids/ 内の全てを処理'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -18,32 +23,51 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create working dirs
+        shell: pwsh
         run: |
-          mkdir tools
-          mkdir output
+          New-Item -Path tools -ItemType Directory -Force | Out-Null
+          New-Item -Path output -ItemType Directory -Force | Out-Null
 
       - name: Download tool archives
+        shell: pwsh
         run: |
-          curl -L -o tools/mid2mml_v1.0b.lzh  "http://zex0.web.fc2.com/tool/mid2mml_v1.0b.lzh"
-          curl -L -o tools/ppmck09a.zip "http://ppmck.web.fc2.com/ppmck/ppmck09a.zip"
+          $mid2mmlUrl = "http://zex0.web.fc2.com/tool/mid2mml_v1.0b.lzh"
+          $ppmckUrl   = "http://ppmck.web.fc2.com/ppmck/ppmck09a.zip"
+          Invoke-WebRequest -Uri $mid2mmlUrl -OutFile "tools\mid2mml_v1.0b.lzh" -UseBasicParsing
+          Invoke-WebRequest -Uri $ppmckUrl   -OutFile "tools\ppmck09a.zip"   -UseBasicParsing
 
-      - name: Extract archives (7zip on windows runner)
-        shell: bash
+      - name: Extract archives (7z on windows runner)
+        shell: pwsh
         run: |
-          # windows-latest has 7z available as 7z.exe in PATH; use 7z (pwsh can also use Expand-Archive but .lzh isn't supported)
-          # extract mid2mml.lzh into tools/mid2mml
-          mkdir -p tools/mid2mml
-          7z x tools/mid2mml_v1.0b.lzh -o./tools/mid2mml || (echo "mid2mml extraction may have failed"; exit 1)
-          # extract ppmck zip
-          mkdir -p tools/ppmck
-          7z x tools/ppmck09a.zip -o./tools/ppmck || (echo "ppmck extraction may have failed"; exit 1)
+          # ensure destination folders
+          New-Item -Path tools\mid2mml -ItemType Directory -Force | Out-Null
+          New-Item -Path tools\ppmck -ItemType Directory -Force | Out-Null
+
+          # 7z が PATH にある前提. -y を付けて上書き確認を無視
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            Write-Host "7z not found in PATH - extraction will likely fail"
+            exit 1
+          }
+
+          & 7z x "tools\mid2mml_v1.0b.lzh" "-otools\mid2mml" -y
+          & 7z x "tools\ppmck09a.zip" "-otools\ppmck" -y
 
       - name: List extracted files (for debugging)
+        shell: pwsh
         run: |
-          echo "=== tools/mid2mml ==="
-          dir tools\mid2mml /s
-          echo "=== tools/ppmck ==="
-          dir tools\ppmck /s
+          Write-Host "=== tools/mid2mml ==="
+          if (Test-Path "./tools/mid2mml") {
+            Get-ChildItem -Path "./tools/mid2mml" -Recurse -Force | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Host "tools/mid2mml not found"
+          }
+
+          Write-Host "=== tools/ppmck ==="
+          if (Test-Path "./tools/ppmck") {
+            Get-ChildItem -Path "./tools/ppmck" -Recurse -Force | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Host "tools/ppmck not found"
+          }
 
       - name: Convert .mid -> .mml and .mml -> .nsf
         shell: pwsh
@@ -58,6 +82,21 @@ jobs:
 
           $outDir = Join-Path $PWD "output"
           New-Item -Path $outDir -ItemType Directory -Force | Out-Null
+
+          # If workflow_dispatch provided a filename, only process that
+          $inputMid = "${{ github.event.inputs.mid_filename }}"
+          if ($inputMid -and $inputMid.Trim() -ne "") {
+            $searchPattern = $inputMid
+            Write-Host "Manual run: targeting specific file: $searchPattern"
+            $mids = Get-ChildItem -Path $midDir -Filter $searchPattern -Recurse -ErrorAction SilentlyContinue
+          } else {
+            $mids = Get-ChildItem -Path $midDir -Filter *.mid -Recurse -ErrorAction SilentlyContinue
+          }
+
+          if ($null -eq $mids -or $mids.Count -eq 0) {
+            Write-Host "No .mid files found under mids/. Exiting."
+            exit 0
+          }
 
           # find possible executables
           $mid2mmlExe = Get-ChildItem -Path (Join-Path $PWD "tools\mid2mml") -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -76,12 +115,6 @@ jobs:
             Write-Host "Using ppmck exe: $($ppmckExe.FullName)"
           }
 
-          $mids = Get-ChildItem -Path $midDir -Filter *.mid -Recurse
-          if ($mids.Count -eq 0) {
-            Write-Host "No .mid files found under mids/. Exiting."
-            exit 0
-          }
-
           foreach ($mid in $mids) {
             Write-Host "---- Processing $($mid.FullName) ----"
 
@@ -90,17 +123,14 @@ jobs:
             $tempMmlCandidates = @()
 
             if ($mid2mmlExe -ne $null) {
-              # Try a few common invocation patterns. Many old tools either accept input filename as single arg
-              # or expect output file created alongside input. We'll try and then search for produced .mml files.
-              Write-Host "Attempting to run mid2mml with possible argument orders..."
+              Write-Host "Attempting to run mid2mml (best-effort)..."
               Push-Location $mid2mmlExe.DirectoryName
               try {
-                # 1) exe input.mid
                 & $mid2mmlExe.FullName $mid.FullName
               } catch {
-                Write-Warning "mid2mml run (arg style 1) failed: $_"
+                Write-Warning "mid2mml run (simple) failed: $_"
               }
-              # 2) try exe -i input -o output (if supported)
+
               try {
                 & $mid2mmlExe.FullName "-i" $mid.FullName "-o" $mmlPath
               } catch {
@@ -108,7 +138,7 @@ jobs:
               }
               Pop-Location
 
-              # Search for any .mml produced (in tool dir or repo root)
+              # Search for recently created .mml files
               $candidates = Get-ChildItem -Path . -Include *.mml -Recurse -ErrorAction SilentlyContinue |
                             Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } |
                             Sort-Object LastWriteTime -Descending
@@ -119,14 +149,12 @@ jobs:
               Write-Warning "No mid2mml exe found; skipping .mid -> .mml."
             }
 
-            # If found candidate, pick first and move to outDir with stable name
             if ($tempMmlCandidates.Count -gt 0) {
               $chosen = $tempMmlCandidates | Select-Object -First 1
               Write-Host "Found generated .mml: $chosen"
               Copy-Item -Path $chosen -Destination $mmlPath -Force
             } else {
-              Write-Warning "No .mml generated automatically; attempting to create a simple placeholder MML file."
-              # create small placeholder so ppmck step can at least try
+              Write-Warning "No .mml generated automatically; creating placeholder MML."
               "$($mid.BaseName) // placeholder mml (conversion may have failed)" | Out-File -FilePath $mmlPath -Encoding ascii
             }
 
@@ -136,21 +164,16 @@ jobs:
               Write-Host "Attempting to run ppmck to produce $nsfPath"
 
               Push-Location $ppmckExe.DirectoryName
-              $tried = $false
               try {
-                # Common usage variants tried:
-                # ppmck.exe [-o out.nsf] input.mml
                 & $ppmckExe.FullName "-o" $nsfPath $mmlPath
-                $tried = $true
               } catch {
-                Write-Warning "ppmck run (style -o out in front) failed: $_"
+                Write-Warning "ppmck run variant 1 failed: $_"
               }
               if (-not (Test-Path $nsfPath)) {
                 try {
                   & $ppmckExe.FullName $mmlPath "-o" $nsfPath
-                  $tried = $true
                 } catch {
-                  Write-Warning "ppmck run (style input then -o) failed: $_"
+                  Write-Warning "ppmck run variant 2 failed: $_"
                 }
               }
               Pop-Location
@@ -176,6 +199,7 @@ jobs:
           path: output/**
 
       - name: Workflow finished - debug listing
+        shell: pwsh
         run: |
-          echo "=== FINAL OUTPUT ==="
-          dir output /s
+          Write-Host "=== FINAL OUTPUT ==="
+          if (Test-Path ./output) { Get-ChildItem -Path ./output -Recurse | ForEach-Object { Write-Host $_.FullName } } else { Write-Host "No output folder." }
