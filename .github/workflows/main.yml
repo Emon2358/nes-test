@@ -1,4 +1,4 @@
-name: MID → MML → NSF converter
+name: MID → MML → NSF converter (use mknsf if available)
 
 on:
   push:
@@ -22,11 +22,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create working dirs
+      - name: Prepare dirs
         shell: pwsh
         run: |
           New-Item -Path tools -ItemType Directory -Force | Out-Null
           New-Item -Path output -ItemType Directory -Force | Out-Null
+          New-Item -Path mids -ItemType Directory -Force | Out-Null
 
       - name: Download tool archives
         shell: pwsh
@@ -36,19 +37,19 @@ jobs:
           Invoke-WebRequest -Uri $mid2mmlUrl -OutFile "tools\mid2mml_v1.0b.lzh" -UseBasicParsing
           Invoke-WebRequest -Uri $ppmckUrl   -OutFile "tools\ppmck09a.zip"   -UseBasicParsing
 
-      - name: Extract archives (7z on windows runner)
+      - name: Extract archives (7z required on runner)
         shell: pwsh
         run: |
           New-Item -Path tools\mid2mml -ItemType Directory -Force | Out-Null
           New-Item -Path tools\ppmck -ItemType Directory -Force | Out-Null
           if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
-            Write-Host "7z not found in PATH - extraction will likely fail"
+            Write-Host "ERROR: 7z not found in PATH on runner. Extraction will fail."
             exit 1
           }
           & 7z x "tools\mid2mml_v1.0b.lzh" "-otools\mid2mml" -y
           & 7z x "tools\ppmck09a.zip" "-otools\ppmck" -y
 
-      - name: List extracted files (for debugging)
+      - name: List extracted files (debug)
         shell: pwsh
         run: |
           Write-Host "=== tools/mid2mml ==="
@@ -60,11 +61,10 @@ jobs:
             Get-ChildItem -Path "./tools/ppmck" -Recurse -Force | ForEach-Object { Write-Host $_.FullName }
           } else { Write-Host "tools/ppmck not found" }
 
-      - name: Convert .mid -> .mml and .mml -> .nsf (robust)
+      - name: Convert .mid -> .mml and .mml -> .nsf (prefer mknsf)
         shell: pwsh
         run: |
-          # NB: this step is robust: it logs ppmck stdout/stderr, checks file existence,
-          # uses input->output argument order, and does not fail the entire job on ppmck error.
+          $ErrorActionPreference = 'Stop'
 
           $midDir = Join-Path $PWD "mids"
           if (-not (Test-Path $midDir)) {
@@ -87,81 +87,129 @@ jobs:
             exit 0
           }
 
+          # executables
           $mid2mmlExe = Get-ChildItem -Path (Join-Path $PWD "tools\mid2mml") -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $mid2mmlExe) {
-            Write-Warning "mid2mml executable not found in tools/mid2mml. Listing files:"
-            Get-ChildItem -Path tools\mid2mml -Recurse | ForEach-Object { Write-Host $_.FullName }
-          } else { Write-Host "Using mid2mml exe: $($mid2mmlExe.FullName)" }
+          $ppmckExe   = Get-ChildItem -Path (Join-Path $PWD "tools\ppmck") -Filter ppmck*.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $mknsfExe   = Get-ChildItem -Path (Join-Path $PWD "tools\ppmck") -Filter mknsf*.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 
-          $ppmckExe = Get-ChildItem -Path (Join-Path $PWD "tools\ppmck") -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $ppmckExe) {
-            Write-Warning "ppmck executable not found in tools/ppmck. Listing files:"
-            Get-ChildItem -Path tools\ppmck -Recurse | ForEach-Object { Write-Host $_.FullName }
-          } else { Write-Host "Using ppmck exe: $($ppmckExe.FullName)" }
+          if ($mid2mmlExe) { Write-Host "mid2mml detected: $($mid2mmlExe.FullName)" } else { Write-Warning "mid2mml.exe not found" }
+          if ($ppmckExe)   { Write-Host "ppmck detected:   $($ppmckExe.FullName)" } else { Write-Warning "ppmck.exe not found" }
+          if ($mknsfExe)   { Write-Host "mknsf detected:   $($mknsfExe.FullName)" } else { Write-Host "mknsf not found; will try ppmck variants." }
+
+          # helper to run process and print logs
+          function Run-Proc($exePath, $args, $workDir) {
+            $stdout = Join-Path $workDir "last_stdout.txt"
+            $stderr = Join-Path $workDir "last_stderr.txt"
+            if (Test-Path $stdout) { Remove-Item $stdout -Force }
+            if (Test-Path $stderr) { Remove-Item $stderr -Force }
+            Write-Host "Running: $exePath $($args -join ' ')  (workdir: $workDir)"
+            $proc = Start-Process -FilePath $exePath -ArgumentList $args -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WorkingDirectory $workDir
+            $exit = $proc.ExitCode
+            if (Test-Path $stdout) { Write-Host "---- stdout ----"; Get-Content $stdout | ForEach-Object { Write-Host $_ } }
+            if (Test-Path $stderr) { Write-Host "---- stderr ----"; Get-Content $stderr | ForEach-Object { Write-Host $_ } }
+            return $exit
+          }
 
           foreach ($mid in $mids) {
-            Write-Host "---- Processing $($mid.FullName) ----"
+            Write-Host "==== Processing $($mid.Name) ===="
             $mmlPath = Join-Path $outDir ($mid.BaseName + ".mml")
-            $tempMmlCandidates = @()
+            $nsfPath = Join-Path $outDir ($mid.BaseName + ".nsf")
 
-            if ($mid2mmlExe -ne $null) {
-              Write-Host "Running mid2mml (best-effort) to produce .mml..."
+            # 1) MID -> MML (best-effort)
+            if ($mid2mmlExe) {
+              Write-Host "Running mid2mml to generate MML (best-effort)..."
               Push-Location $mid2mmlExe.DirectoryName
-              try { & $mid2mmlExe.FullName $mid.FullName } catch { Write-Warning "mid2mml run (simple) failed: $_" }
+              try { & $mid2mmlExe.FullName $mid.FullName } catch { Write-Warning "mid2mml simple run failed: $_" }
               try { & $mid2mmlExe.FullName "-i" $mid.FullName "-o" $mmlPath } catch {}
               Pop-Location
-
-              # pick up any recent .mml outputs
-              $candidates = Get-ChildItem -Path . -Include *.mml -Recurse -ErrorAction SilentlyContinue |
-                            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } |
-                            Sort-Object LastWriteTime -Descending
-              foreach ($c in $candidates) { $tempMmlCandidates += $c.FullName }
-            } else {
-              Write-Warning "No mid2mml exe found; skipping .mid -> .mml."
-            }
-
-            if ($tempMmlCandidates.Count -gt 0) {
-              $chosen = $tempMmlCandidates | Select-Object -First 1
-              Write-Host "Found generated .mml: $chosen"
-              Copy-Item -Path $chosen -Destination $mmlPath -Force
-            } else {
-              Write-Warning "No .mml generated automatically; creating placeholder MML so ppmck can at least be invoked."
-              "$($mid.BaseName) // placeholder mml (conversion may have failed)" | Out-File -FilePath $mmlPath -Encoding ascii
-            }
-
-            # MML -> NSF using ppmck: use explicit argument order: input.mml then output.nsf
-            if ($ppmckExe -ne $null) {
-              if (-not (Test-Path $mmlPath)) {
-                Write-Warning "MML file missing: $mmlPath - skipping ppmck for this mid."
-                continue
-              }
-
-              $nsfPath = Join-Path $outDir ($mid.BaseName + ".nsf")
-              Write-Host "Running ppmck: input -> output"
-              Push-Location $ppmckExe.DirectoryName
-
-              # ensure old logs removed
-              if (Test-Path "./ppmck_stdout.txt") { Remove-Item "./ppmck_stdout.txt" -Force }
-              if (Test-Path "./ppmck_stderr.txt") { Remove-Item "./ppmck_stderr.txt" -Force }
-
-              # Use Start-Process to capture stdout/stderr and get exit code
-              $argList = @("$mmlPath", "$nsfPath")
-              $proc = Start-Process -FilePath $ppmckExe.FullName -ArgumentList $argList -NoNewWindow -Wait -PassThru -RedirectStandardOutput "./ppmck_stdout.txt" -RedirectStandardError "./ppmck_stderr.txt"
-              $exit = $proc.ExitCode
-              Write-Host "ppmck exit code: $exit"
-              if (Test-Path "./ppmck_stdout.txt") { Write-Host "---- ppmck stdout ----"; Get-Content "./ppmck_stdout.txt" | ForEach-Object { Write-Host $_ } }
-              if (Test-Path "./ppmck_stderr.txt") { Write-Host "---- ppmck stderr ----"; Get-Content "./ppmck_stderr.txt" | ForEach-Object { Write-Host $_ } }
-
-              Pop-Location
-
-              if ($exit -eq 0 -and (Test-Path $nsfPath)) {
-                Write-Host "Created NSF: $nsfPath"
+              # find recent .mml
+              $cand = Get-ChildItem -Path . -Include *.mml -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if ($cand) {
+                Copy-Item -Path $cand.FullName -Destination $mmlPath -Force
+                Write-Host "MML produced: $($cand.FullName) -> $mmlPath"
               } else {
-                Write-Warning "ppmck failed or NSF not created for $($mid.Name). Exit code: $exit"
-                # keep going; do not fail the whole workflow so we can still collect logs/artifacts
+                Write-Warning "No MML produced automatically; creating placeholder MML: $mmlPath"
+                "$($mid.BaseName) // placeholder mml" | Out-File -FilePath $mmlPath -Encoding ascii
               }
             } else {
-              Write-Warning "ppmck exe not found; skipping MML -> NSF for $($mid.Name)"
+              Write-Warning "mid2mml.exe not available; creating placeholder MML."
+              "$($mid.BaseName) // placeholder mml" | Out-File -FilePath $mmlPath -Encoding ascii
+            }
+
+            # Ensure output path doesn't have leftover NSF
+            if (Test-Path $nsfPath) { Remove-Item $nsfPath -Force }
+
+            $succeeded = $false
+
+            # 2) If mknsf exists, use it: mknsf <baseName>  (MML must be in same dir)
+            if ($mknsfExe) {
+              Write-Host "Attempting mknsf mode (preferred). Copying MML into ppmck dir and invoking mknsf <basename>."
+              $localMml = Join-Path $mknsfExe.DirectoryName ($mid.BaseName + ".mml")
+              Copy-Item -Path $mmlPath -Destination $localMml -Force
+              # cleanup possible old local nsf
+              $localNsf = Join-Path $mknsfExe.DirectoryName ($mid.BaseName + ".nsf")
+              if (Test-Path $localNsf) { Remove-Item $localNsf -Force }
+              # run mknsf with basename only (no extension)
+              $basename = $mid.BaseName
+              $exit = Run-Proc $mknsfExe.FullName @($basename) $mknsfExe.DirectoryName
+              Write-Host "mknsf exit code: $exit"
+              # if created local nsf, copy back
+              if (Test-Path $localNsf) {
+                Copy-Item -Path $localNsf -Destination $nsfPath -Force
+                Write-Host "NSF created by mknsf and copied to $nsfPath"
+                $succeeded = $true
+              } else {
+                Write-Warning "mknsf did not produce NSF in ppmck dir."
+              }
+            }
+
+            # 3) If still not succeeded, fallback to trying ppmck.exe variants (absolute + local)
+            if (-not $succeeded -and $ppmckExe) {
+              Write-Host "mknsf mode did not succeed (or not available). Trying ppmck variants..."
+              # patterns to try (absolute)
+              $patterns = @()
+              $patterns += , @($mmlPath, $nsfPath)
+              $patterns += , @("-o", $nsfPath, $mmlPath)
+              $patterns += , @($mmlPath, "-o", $nsfPath)
+              $patterns += , @("-i", $mmlPath, "-o", $nsfPath)
+              $patterns += , @($mmlPath)
+              foreach ($pat in $patterns) {
+                $exit = Run-Proc $ppmckExe.FullName $pat $ppmckExe.DirectoryName
+                if ($exit -eq 0 -and (Test-Path $nsfPath)) {
+                  Write-Host "NSF produced at $nsfPath"
+                  $succeeded = $true
+                  break
+                }
+              }
+
+              # local mode: copy mml to ppmck dir and use local filenames (in case ppmck expects that)
+              if (-not $succeeded) {
+                $localMmlName = $mid.BaseName + ".mml"
+                $localNsfName = $mid.BaseName + ".nsf"
+                $localMmlFull = Join-Path $ppmckExe.DirectoryName $localMmlName
+                $localNsfFull = Join-Path $ppmckExe.DirectoryName $localNsfName
+                Copy-Item -Path $mmlPath -Destination $localMmlFull -Force
+                if (Test-Path $localNsfFull) { Remove-Item $localNsfFull -Force }
+                $patterns_local = @()
+                $patterns_local += , @($localMmlName, $localNsfName)
+                $patterns_local += , @($localMmlName, "-o", $localNsfName)
+                $patterns_local += , @("-o", $localNsfName, $localMmlName)
+                foreach ($pat in $patterns_local) {
+                  $exit = Run-Proc $ppmckExe.FullName $pat $ppmckExe.DirectoryName
+                  if (Test-Path $localNsfFull) {
+                    Copy-Item -Path $localNsfFull -Destination $nsfPath -Force
+                    Write-Host "NSF created at local path then copied to $nsfPath"
+                    $succeeded = $true
+                    break
+                  }
+                }
+              }
+            } # end ppmck fallback
+
+            if (-not $succeeded) {
+              Write-Warning "All attempts failed for $($mid.Name). See logs above (stdout/stderr)."
+            } else {
+              Write-Host "Success for $($mid.Name)."
             }
 
           } # foreach mid
@@ -169,7 +217,7 @@ jobs:
           Write-Host "Conversion step finished. Output files (output/):"
           if (Test-Path $outDir) { Get-ChildItem -Path $outDir -Recurse | ForEach-Object { Write-Host $_.FullName } } else { Write-Host "No output folder." }
 
-          # ensure script exits successfully so the artifacts step will run
+          # finish successfully so artifacts get uploaded
           exit 0
 
       - name: Upload output artifacts
@@ -178,7 +226,7 @@ jobs:
           name: converted-artifacts
           path: output/**
 
-      - name: Workflow finished - debug listing
+      - name: Final listing
         shell: pwsh
         run: |
           Write-Host "=== FINAL OUTPUT ==="
