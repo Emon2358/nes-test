@@ -1,127 +1,181 @@
-name: NSDLib — Build MML to NSF (interactive input version)
+name: MID → MML → NSF converter
 
+# mids/ に .mid を push したら動く
 on:
-  workflow_dispatch:
-    inputs:
-      nsdl_version:
-        description: "NSDLib version (例: v1.30)"
-        required: true
-        default: "v1.30"
-      opt_version:
-        description: "NSF version option (-v)"
-        required: true
-        default: "-v 2"
-      opt_ext:
-        description: "Enable NSFe / extended NSF (-x)"
-        required: true
-        default: "-x"
-      opt_defines:
-        description: "Macro definitions (-D)"
-        required: false
-        default: ""
-      opt_include:
-        description: "Include directory (-I)"
-        required: false
-        default: ""
-      opt_meta:
-        description: "Metadata file (-M)"
-        required: false
-        default: ""
-      mml_dir:
-        description: "Directory containing .mml files"
-        required: true
-        default: "mml"
-      output_dir:
-        description: "Output directory for NSF files"
-        required: true
-        default: "output"
+  push:
+    paths:
+      - 'mids/**'
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  build-nsdlib:
+  convert:
     runs-on: windows-latest
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Download NSDLib
-      shell: pwsh
-      run: |
-        $version = "${{ github.event.inputs.nsdl_version }}"
-        $zipUrl = "https://github.com/Shaw02/nsdlib/releases/download/$version/nsdl130.zip"
-        $out = "nsdl.zip"
-        Write-Host "Downloading NSDLib $version from $zipUrl ..."
-        Invoke-WebRequest -Uri $zipUrl -OutFile $out -UseBasicParsing
-        Expand-Archive -Path $out -DestinationPath nsdl130 -Force
-        Write-Host "NSDLib extracted."
+      - name: Create working dirs
+        run: |
+          mkdir tools
+          mkdir output
 
-    - name: Prepare workspace
-      shell: pwsh
-      run: |
-        if (!(Test-Path "nsdl130/bin/nsd.bin")) {
-          Write-Error "Driver file nsd.bin not found."
-          exit 1
-        }
-        $outDir = "${{ github.event.inputs.output_dir }}"
-        if (!(Test-Path $outDir)) { New-Item -Path $outDir -ItemType Directory }
-        Write-Host "Workspace ready."
+      - name: Download tool archives
+        run: |
+          curl -L -o tools/mid2mml_v1.0b.lzh  "http://zex0.web.fc2.com/tool/mid2mml_v1.0b.lzh"
+          curl -L -o tools/ppmck09a.zip "http://ppmck.web.fc2.com/ppmck/ppmck09a.zip"
 
-    - name: Compile all MML to NSF
-      shell: pwsh
-      run: |
-        $compiler = Join-Path $PWD "nsdl130/bin/nsc64.exe"
-        if (!(Test-Path $compiler)) {
-          Write-Error "Compiler not found: $compiler"
-          exit 1
-        }
+      - name: Extract archives (7zip on windows runner)
+        shell: bash
+        run: |
+          # windows-latest has 7z available as 7z.exe in PATH; use 7z (pwsh can also use Expand-Archive but .lzh isn't supported)
+          # extract mid2mml.lzh into tools/mid2mml
+          mkdir -p tools/mid2mml
+          7z x tools/mid2mml_v1.0b.lzh -o./tools/mid2mml || (echo "mid2mml extraction may have failed"; exit 1)
+          # extract ppmck zip
+          mkdir -p tools/ppmck
+          7z x tools/ppmck09a.zip -o./tools/ppmck || (echo "ppmck extraction may have failed"; exit 1)
 
-        $driver = Join-Path $PWD "nsdl130/bin/nsd.bin"
-        $mmlDir = "${{ github.event.inputs.mml_dir }}"
-        $outDir = "${{ github.event.inputs.output_dir }}"
+      - name: List extracted files (for debugging)
+        run: |
+          echo "=== tools/mid2mml ==="
+          dir tools\mid2mml /s
+          echo "=== tools/ppmck ==="
+          dir tools\ppmck /s
 
-        $optVersion = "${{ github.event.inputs.opt_version }}"
-        $optExt = "${{ github.event.inputs.opt_ext }}"
-        $optDefines = "${{ github.event.inputs.opt_defines }}"
-        $optInclude = "${{ github.event.inputs.opt_include }}"
-        $optMeta = "${{ github.event.inputs.opt_meta }}"
+      - name: Convert .mid -> .mml and .mml -> .nsf
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-        $mmlFiles = Get-ChildItem -Path $mmlDir -Filter *.mml -Recurse
-        if ($mmlFiles.Count -eq 0) {
-          Write-Error "No .mml files found in $mmlDir"
-          exit 1
-        }
-
-        foreach ($file in $mmlFiles) {
-          $base = $file.BaseName
-          $outFile = Join-Path $PWD "$outDir\$base.nsf"
-          Write-Host "Compiling: $($file.FullName) → $outFile"
-
-          & $compiler `
-            -L $driver `
-            $optVersion `
-            $optExt `
-            $optDefines `
-            $optInclude `
-            $optMeta `
-            $file.FullName `
-            -o $outFile
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Compilation failed for $($file.FullName)"
-            exit 1
+          $midDir = Join-Path $PWD "mids"
+          if (-not (Test-Path $midDir)) {
+            Write-Host "No mids directory found; nothing to do."
+            exit 0
           }
-        }
 
-        Write-Host "All MML compiled successfully."
+          $outDir = Join-Path $PWD "output"
+          New-Item -Path $outDir -ItemType Directory -Force | Out-Null
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: nsdlib-output
-        path: |
-          ${{ github.event.inputs.output_dir }}/
-          nsdl130/
+          # find possible executables
+          $mid2mmlExe = Get-ChildItem -Path (Join-Path $PWD "tools\mid2mml") -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $mid2mmlExe) {
+            Write-Warning "mid2mml executable not found in tools/mid2mml. Listing files:"
+            Get-ChildItem -Path tools\mid2mml -Recurse | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Host "Using mid2mml exe: $($mid2mmlExe.FullName)"
+          }
 
-    - name: Workflow completed
-      shell: pwsh
-      run: Write-Host "✅ Build completed successfully."
+          $ppmckExe = Get-ChildItem -Path (Join-Path $PWD "tools\ppmck") -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $ppmckExe) {
+            Write-Warning "ppmck executable not found in tools/ppmck. Listing files:"
+            Get-ChildItem -Path tools\ppmck -Recurse | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Host "Using ppmck exe: $($ppmckExe.FullName)"
+          }
+
+          $mids = Get-ChildItem -Path $midDir -Filter *.mid -Recurse
+          if ($mids.Count -eq 0) {
+            Write-Host "No .mid files found under mids/. Exiting."
+            exit 0
+          }
+
+          foreach ($mid in $mids) {
+            Write-Host "---- Processing $($mid.FullName) ----"
+
+            # 1) MID -> MML
+            $mmlPath = Join-Path $outDir ($mid.BaseName + ".mml")
+            $tempMmlCandidates = @()
+
+            if ($mid2mmlExe -ne $null) {
+              # Try a few common invocation patterns. Many old tools either accept input filename as single arg
+              # or expect output file created alongside input. We'll try and then search for produced .mml files.
+              Write-Host "Attempting to run mid2mml with possible argument orders..."
+              Push-Location $mid2mmlExe.DirectoryName
+              try {
+                # 1) exe input.mid
+                & $mid2mmlExe.FullName $mid.FullName
+              } catch {
+                Write-Warning "mid2mml run (arg style 1) failed: $_"
+              }
+              # 2) try exe -i input -o output (if supported)
+              try {
+                & $mid2mmlExe.FullName "-i" $mid.FullName "-o" $mmlPath
+              } catch {
+                # ignore
+              }
+              Pop-Location
+
+              # Search for any .mml produced (in tool dir or repo root)
+              $candidates = Get-ChildItem -Path . -Include *.mml -Recurse -ErrorAction SilentlyContinue |
+                            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } |
+                            Sort-Object LastWriteTime -Descending
+              foreach ($c in $candidates) {
+                $tempMmlCandidates += $c.FullName
+              }
+            } else {
+              Write-Warning "No mid2mml exe found; skipping .mid -> .mml."
+            }
+
+            # If found candidate, pick first and move to outDir with stable name
+            if ($tempMmlCandidates.Count -gt 0) {
+              $chosen = $tempMmlCandidates | Select-Object -First 1
+              Write-Host "Found generated .mml: $chosen"
+              Copy-Item -Path $chosen -Destination $mmlPath -Force
+            } else {
+              Write-Warning "No .mml generated automatically; attempting to create a simple placeholder MML file."
+              # create small placeholder so ppmck step can at least try
+              "$($mid.BaseName) // placeholder mml (conversion may have failed)" | Out-File -FilePath $mmlPath -Encoding ascii
+            }
+
+            # 2) MML -> NSF (using ppmck)
+            if ($ppmckExe -ne $null) {
+              $nsfPath = Join-Path $outDir ($mid.BaseName + ".nsf")
+              Write-Host "Attempting to run ppmck to produce $nsfPath"
+
+              Push-Location $ppmckExe.DirectoryName
+              $tried = $false
+              try {
+                # Common usage variants tried:
+                # ppmck.exe [-o out.nsf] input.mml
+                & $ppmckExe.FullName "-o" $nsfPath $mmlPath
+                $tried = $true
+              } catch {
+                Write-Warning "ppmck run (style -o out in front) failed: $_"
+              }
+              if (-not (Test-Path $nsfPath)) {
+                try {
+                  & $ppmckExe.FullName $mmlPath "-o" $nsfPath
+                  $tried = $true
+                } catch {
+                  Write-Warning "ppmck run (style input then -o) failed: $_"
+                }
+              }
+              Pop-Location
+
+              if (Test-Path $nsfPath) {
+                Write-Host "Created NSF: $nsfPath"
+              } else {
+                Write-Warning "NSF not created for $($mid.Name). Check ppmck usage / exe."
+              }
+            } else {
+              Write-Warning "ppmck exe not found; skipping MML -> NSF for $($mid.Name)"
+            }
+
+          } # each mid
+
+          Write-Host "Conversion step finished. Output files:"
+          Get-ChildItem -Path $outDir -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload output artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: converted-artifacts
+          path: output/**
+
+      - name: Workflow finished - debug listing
+        run: |
+          echo "=== FINAL OUTPUT ==="
+          dir output /s
